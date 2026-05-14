@@ -69,37 +69,19 @@ jobs:
               --image ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
           fi
 
-      - name: Enable system-assigned managed identity
+      - name: Inject USPTO API key from Key Vault
         run: |
-          az containerapp identity assign \
-            --name ${{ env.CONTAINER_APP_NAME }} \
-            --resource-group ${{ env.RESOURCE_GROUP }} \
-            --system-assigned
-
-      - name: Grant managed identity access to Key Vault
-        run: |
-          PRINCIPAL_ID=$(az containerapp show \
-            --name ${{ env.CONTAINER_APP_NAME }} \
-            --resource-group ${{ env.RESOURCE_GROUP }} \
-            --query "identity.principalId" -o tsv)
-
-          az role assignment create \
-            --assignee "$PRINCIPAL_ID" \
-            --role "Key Vault Secrets User" \
-            --scope "/subscriptions/${{ vars.AZURE_SUBSCRIPTION_ID || '4c77f152-9b87-4d52-96bc-0c8ba29cd97e' }}/resourceGroups/${{ env.RESOURCE_GROUP }}/providers/Microsoft.KeyVault/vaults/kv-offset3" \
-            || echo "Role assignment already exists"
-
-      - name: Wire Key Vault secret reference
-        run: |
-          KV_SECRET_URI=$(az keyvault secret show \
+          # Read the secret value using the deployment SP (already has KV Secrets User role)
+          USPTO_KEY=$(az keyvault secret show \
             --vault-name kv-offset3 \
             --name uspto-odp-api-key \
-            --query "id" -o tsv)
+            --query "value" -o tsv)
 
+          # Store as a Container App secret and wire to env var
           az containerapp secret set \
             --name ${{ env.CONTAINER_APP_NAME }} \
             --resource-group ${{ env.RESOURCE_GROUP }} \
-            --secrets "uspto-api-key=keyvaultref:${KV_SECRET_URI},identityref:system"
+            --secrets "uspto-api-key=${USPTO_KEY}"
 
           az containerapp update \
             --name ${{ env.CONTAINER_APP_NAME }} \
