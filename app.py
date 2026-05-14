@@ -483,7 +483,8 @@ streamable_http_subapp = _NormalizeMountedRootPath(streamable_http_starlette_app
 @asynccontextmanager
 async def lifespan(app):
     logger.info("odp-mcp starting — USPTO ODP MCP server")
-    yield
+    async with mcp.session_manager.run():
+        yield
     logger.info("odp-mcp shutdown")
 
 
