@@ -11,7 +11,7 @@ env:
   IMAGE_NAME: odp-mcp
   RESOURCE_GROUP: rg-offset3
   CONTAINER_APP_NAME: odp-mcp
-  CONTAINER_APP_ENV: managedEnvironment-rgoffset3-b8e3
+  CONTAINER_APP_ENV: cae-offset3
 
 jobs:
   build-and-deploy:
