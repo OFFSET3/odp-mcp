@@ -155,7 +155,13 @@ async def _post(
 def _xml_element_to_value(element: ET.Element) -> Any:
     children = list(element)
     if not children:
-        return (element.text or "").strip()
+        text_value = (element.text or "").strip()
+        if element.attrib:
+            return {
+                "_text": text_value,
+                "_attributes": dict(element.attrib),
+            }
+        return text_value
 
     value: dict[str, Any] = {}
     for child in children:

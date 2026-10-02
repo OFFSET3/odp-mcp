@@ -64,6 +64,17 @@ class HeaderTests(unittest.TestCase):
         self.assertEqual(value["status"], "LIVE")
         self.assertEqual(value["owner"], ["A", "B"])
 
+    def test_xml_parser_preserves_leaf_attributes(self):
+        root = app.ET.fromstring(
+            '<Transaction><status code="1" lang="en">LIVE</status></Transaction>'
+        )
+        value = app._xml_element_to_value(root)
+        self.assertEqual(value["status"]["_text"], "LIVE")
+        self.assertEqual(
+            value["status"]["_attributes"],
+            {"code": "1", "lang": "en"},
+        )
+
 
 class AsyncToolTests(unittest.IsolatedAsyncioTestCase):
     async def test_odp_fallback_normalizes_application(self):
