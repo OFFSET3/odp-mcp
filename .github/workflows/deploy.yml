@@ -69,24 +69,41 @@ jobs:
               --image ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
           fi
 
-      - name: Inject USPTO API key from Key Vault
+      - name: Inject USPTO API keys from Key Vault
         run: |
-          # Read the secret value using the deployment SP (already has KV Secrets User role)
+          # Read credentials using the deployment SP (KV Secrets User role).
+          # Mask both values before passing them to Container Apps.
           USPTO_KEY=$(az keyvault secret show \
             --vault-name kv-offset3 \
             --name uspto-odp-api-key \
             --query "value" -o tsv)
+          TSDR_KEY=$(az keyvault secret show \
+            --vault-name kv-offset3 \
+            --name uspto-tsdr-api-key \
+            --query "value" -o tsv)
 
-          # Store as a Container App secret and wire to env var
+          echo "::add-mask::${USPTO_KEY}"
+          echo "::add-mask::${TSDR_KEY}"
+
+          if [ -z "${USPTO_KEY}" ] || [ -z "${TSDR_KEY}" ]; then
+            echo "Required USPTO credential missing from Key Vault." >&2
+            exit 1
+          fi
+
+          # Store credentials as Container App secrets and expose only secret refs.
           az containerapp secret set \
             --name ${{ env.CONTAINER_APP_NAME }} \
             --resource-group ${{ env.RESOURCE_GROUP }} \
-            --secrets "uspto-api-key=${USPTO_KEY}"
+            --secrets \
+              "uspto-api-key=${USPTO_KEY}" \
+              "uspto-tsdr-api-key=${TSDR_KEY}"
 
           az containerapp update \
             --name ${{ env.CONTAINER_APP_NAME }} \
             --resource-group ${{ env.RESOURCE_GROUP }} \
-            --set-env-vars "USPTO_API_KEY=secretref:uspto-api-key"
+            --set-env-vars \
+              "USPTO_API_KEY=secretref:uspto-api-key" \
+              "USPTO_TSDR_API_KEY=secretref:uspto-tsdr-api-key"
 
       - name: Print MCP URL
         run: |
