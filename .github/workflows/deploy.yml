@@ -105,6 +105,20 @@ jobs:
               "USPTO_API_KEY=secretref:uspto-api-key" \
               "USPTO_TSDR_API_KEY=secretref:uspto-tsdr-api-key"
 
+          # Azure Container Apps secrets are application-scoped, but updated
+          # secret values are not picked up automatically by existing revision
+          # replicas. Restart the latest revision so credential rotations take
+          # effect immediately even when the secret-ref names are unchanged.
+          LATEST_REVISION=$(az containerapp show \
+            --name ${{ env.CONTAINER_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query "properties.latestRevisionName" -o tsv)
+
+          az containerapp revision restart \
+            --name ${{ env.CONTAINER_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --revision "${LATEST_REVISION}"
+
       - name: Print MCP URL
         run: |
           FQDN=$(az containerapp show \
