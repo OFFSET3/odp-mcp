@@ -28,7 +28,7 @@ MCP server for the USPTO Open Data Portal (ODP). Exposes patent and trademark se
 |----------|--------|-------------|
 | `USPTO_API_KEY` | Azure Key Vault `kv-offset3/uspto-odp-api-key` | USPTO ODP API key; required |
 | `PATENTSVIEW_API_KEY` | env / secret | Optional PatentsView Search Platform key; when absent, patent search/get fall back to ODP |
-| `USPTO_TSDR_API_KEY` | env / secret | Optional TSDR-specific key; falls back to `USPTO_API_KEY`, but TSDR may require its own credential |
+| `USPTO_TSDR_API_KEY` | env / secret | Dedicated TSDR API Manager key; required for `odp_trademark_status`. The ODP key is not used as a fallback. |
 | `PATENTSVIEW_BASE_URL` | env | Optional PatentsView endpoint override |
 | `USPTO_ODP_APPLICATION_BASE_URL` | env | Optional ODP Patent File Wrapper endpoint override |
 | `USPTO_TSDR_BASE_URL` | env | Optional TSDR endpoint override |
@@ -61,6 +61,19 @@ az keyvault secret set \
 ```
 
 The Container App's system-assigned managed identity is granted `get`/`list` on Key Vault automatically by the workflow.
+
+### Optional TSDR trademark-status support
+
+`odp_trademark_status` requires a separate TSDR API Manager credential. The
+existing ODP credential is intentionally not reused. Until a TSDR credential
+is provisioned and injected as `USPTO_TSDR_API_KEY`, that tool returns a
+structured `424 configuration_required` response without making an upstream
+request. Patent tools and ODP application-status tools do not depend on TSDR.
+
+A future deployment can store the dedicated TSDR credential in Key Vault
+(for example, secret name `uspto-tsdr-api-key`) and expose it to the Container
+App as `USPTO_TSDR_API_KEY`. Do not put the credential value in source or
+GitHub Actions logs.
 
 ## ChatGPT Custom MCP Setup
 
