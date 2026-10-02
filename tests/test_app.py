@@ -20,19 +20,10 @@ class HeaderTests(unittest.TestCase):
             self.assertEqual(app._patentsview_headers()["X-Api-Key"], "pv-test-key")
             self.assertEqual(app._tsdr_headers()["USPTO-API-KEY"], "tsdr-test-key")
 
-    def test_tsdr_falls_back_without_exposing_key(self):
-        import httpx
-
-        with patch.dict(os.environ, {"USPTO_API_KEY": "secret-value"}, clear=True):
-            headers = app._tsdr_headers()
-            self.assertEqual(headers["USPTO-API-KEY"], "secret-value")
-
-            request = httpx.Request("GET", "https://tsdrapi.uspto.gov/example")
-            response = httpx.Response(401, request=request)
-            exc = httpx.HTTPStatusError("unauthorized", request=request, response=response)
-            error = app._upstream_error(exc, service="TSDR")
-            self.assertNotIn("secret-value", repr(error))
-            self.assertEqual(error["status_code"], 401)
+    def test_tsdr_requires_dedicated_key(self):
+        with patch.dict(os.environ, {"USPTO_API_KEY": "odp-only-key"}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "USPTO_TSDR_API_KEY"):
+                app._tsdr_headers()
 
     def test_normalize_application_supports_current_and_alias_metadata(self):
         current = app._normalize_odp_application(
@@ -125,6 +116,15 @@ class AsyncToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["ok"])
         self.assertTrue(mocked.await_args.args[0].endswith("/18123456"))
         self.assertIn("X-API-KEY", mocked.await_args.kwargs["headers"])
+
+    async def test_trademark_status_requires_dedicated_key_before_network(self):
+        with patch.dict(os.environ, {"USPTO_API_KEY": "odp-only-key"}, clear=True):
+            with patch.object(app, "_get_xml", new=AsyncMock()) as mocked:
+                result = await app.odp_trademark_status("97-123456")
+        self.assertEqual(result["status_code"], 424)
+        self.assertTrue(result["configuration_required"])
+        self.assertIn("USPTO_TSDR_API_KEY", result["error"])
+        mocked.assert_not_awaited()
 
     async def test_trademark_status_uses_tsdr_xml_route_and_header(self):
         env = {"USPTO_API_KEY": "odp-test-key", "USPTO_TSDR_API_KEY": "tsdr-test-key"}

@@ -67,14 +67,19 @@ def _patentsview_api_key() -> str:
 
 
 def _tsdr_api_key() -> str:
-    """Return a TSDR key, falling back to USPTO_API_KEY for compatibility.
+    """Return the dedicated TSDR API Manager credential.
 
-    TSDR is a separate USPTO API product. Deployments that have a dedicated
-    TSDR credential should set USPTO_TSDR_API_KEY. Existing installations can
-    still try their ODP key; an upstream 401 is normalized with an actionable
-    message instead of leaking the credential.
+    Live validation shows the ODP credential is not a usable substitute for
+    TSDR. Keep the credential domains separate so a missing TSDR key fails
+    explicitly instead of producing a misleading upstream 404.
     """
-    return os.getenv("USPTO_TSDR_API_KEY", "").strip() or _api_key()
+    key = os.getenv("USPTO_TSDR_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError(
+            "USPTO_TSDR_API_KEY is not set. TSDR requires a separate USPTO "
+            "API Manager credential; configure it before using trademark status."
+        )
+    return key
 
 
 def _truthy_env(value: str | None) -> bool:
@@ -395,6 +400,7 @@ async def odp_capabilities() -> dict[str, Any]:
         "limitations": {
             "odp_patent_fulltext_search": "legacy EFTS public API retired; returns a stable unsupported response",
             "odp_trademark_search": "TSDR has no documented free-text mark-search endpoint",
+            "odp_trademark_status": "requires a separately provisioned USPTO_TSDR_API_KEY credential",
         },
     }
 
@@ -667,6 +673,13 @@ async def odp_trademark_status(
         result["serial_number"] = normalized
         result["source"] = "USPTO TSDR"
         return result
+    except RuntimeError as exc:
+        return {
+            "error": str(exc),
+            "status_code": 424,
+            "service": "TSDR",
+            "configuration_required": True,
+        }
     except httpx.HTTPStatusError as exc:
         return _upstream_error(exc, service="TSDR")
     except ET.ParseError as exc:
