@@ -70,10 +70,11 @@ is provisioned and injected as `USPTO_TSDR_API_KEY`, that tool returns a
 structured `424 configuration_required` response without making an upstream
 request. Patent tools and ODP application-status tools do not depend on TSDR.
 
-A future deployment can store the dedicated TSDR credential in Key Vault
-(for example, secret name `uspto-tsdr-api-key`) and expose it to the Container
-App as `USPTO_TSDR_API_KEY`. Do not put the credential value in source or
-GitHub Actions logs.
+The dedicated TSDR credential is stored in Key Vault as
+`kv-offset3/uspto-tsdr-api-key`. The deployment workflow injects it into the
+Container App as the secret-backed environment variable `USPTO_TSDR_API_KEY`.
+Both USPTO credential values are masked during deployment and must never be
+written to source, issues, pull requests, Taiga, or logs.
 
 ## ChatGPT Custom MCP Setup
 
