@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+import xml.etree.ElementTree as ET
 from contextlib import asynccontextmanager
 from json import JSONDecodeError
 from typing import Any
@@ -117,7 +118,7 @@ def _odp_headers() -> dict[str, str]:
 def _tsdr_headers() -> dict[str, str]:
     return {
         "USPTO-API-KEY": _tsdr_api_key(),
-        "Accept": "application/json",
+        "Accept": "application/xml",
         "User-Agent": "OFFSET3-odp-mcp/2.0",
     }
 
@@ -146,6 +147,41 @@ async def _post(
         return resp.json()
 
 
+def _xml_element_to_value(element: ET.Element) -> Any:
+    children = list(element)
+    if not children:
+        return (element.text or "").strip()
+
+    value: dict[str, Any] = {}
+    for child in children:
+        key = child.tag.rsplit("}", 1)[-1]
+        child_value = _xml_element_to_value(child)
+        existing = value.get(key)
+        if existing is None:
+            value[key] = child_value
+        elif isinstance(existing, list):
+            existing.append(child_value)
+        else:
+            value[key] = [existing, child_value]
+
+    if element.attrib:
+        value["_attributes"] = dict(element.attrib)
+    return value
+
+
+async def _get_xml(
+    url: str,
+    *,
+    headers: dict[str, str],
+) -> dict[str, Any]:
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(url, headers=headers)
+        resp.raise_for_status()
+        root = ET.fromstring(resp.text)
+        root_name = root.tag.rsplit("}", 1)[-1]
+        return {root_name: _xml_element_to_value(root)}
+
+
 def _upstream_error(exc: httpx.HTTPStatusError, *, service: str) -> dict[str, Any]:
     status_code = exc.response.status_code
     if service == "TSDR" and status_code == 401:
@@ -165,24 +201,32 @@ def _normalize_odp_application(record: dict[str, Any]) -> dict[str, Any]:
     # ODP has returned both nested Patent File Wrapper records and flattened
     # patentBag search records across revisions. Accept both shapes.
     meta = record.get("applicationMetaData") or record
-    patent_number = meta.get("patentNumber")
+    patent_number = meta.get("patentNumber") or record.get("patentNumber")
     return {
         "patent_id": patent_number,
         "patent_number": patent_number,
         "patent_title": meta.get("inventionTitle"),
-        "patent_date": meta.get("grantDate"),
+        "patent_date": meta.get("grantDate") or meta.get("patentIssueDate"),
         "application_number": (
-            meta.get("applicationNumberText")
+            record.get("applicationNumberText")
+            or meta.get("applicationNumberText")
             or meta.get("applicationNumber")
-            or record.get("applicationNumberText")
         ),
         "application_status": (
             meta.get("applicationStatusDescriptionText")
             or meta.get("applicationStatusCode")
         ),
         "filing_date": meta.get("filingDate"),
-        "publication_number": meta.get("publicationNumber"),
-        "publication_date": meta.get("publicationDate"),
+        "publication_number": (
+            meta.get("publicationNumber")
+            or meta.get("applicationPublicationNumber")
+            or meta.get("earliestPublicationNumber")
+        ),
+        "publication_date": (
+            meta.get("publicationDate")
+            or meta.get("applicationPublicationDate")
+            or meta.get("earliestPublicationDate")
+        ),
     }
 
 
@@ -616,12 +660,21 @@ async def odp_trademark_status(
         Trademark status, owner, goods/services, and prosecution history.
     """
     normalized = serial_number.strip().replace("-", "").replace(" ", "")
-    url = f"{_TRADEMARK_BASE}/casestatus/sn{normalized}/info.json"
+    url = f"{_TRADEMARK_BASE}/casestatus/sn{normalized}/info.xml"
 
     try:
-        return await _get(url, headers=_tsdr_headers())
+        result = await _get_xml(url, headers=_tsdr_headers())
+        result["serial_number"] = normalized
+        result["source"] = "USPTO TSDR"
+        return result
     except httpx.HTTPStatusError as exc:
         return _upstream_error(exc, service="TSDR")
+    except ET.ParseError as exc:
+        return {
+            "error": f"TSDR returned malformed XML: {exc}",
+            "status_code": 502,
+            "service": "TSDR",
+        }
     except Exception as exc:
         return {"error": str(exc), "service": "TSDR"}
 
