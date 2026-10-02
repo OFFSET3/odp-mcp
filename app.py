@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 from contextlib import asynccontextmanager
 from json import JSONDecodeError
 from typing import Any
@@ -21,24 +22,58 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# USPTO ODP base URLs
+# USPTO / PatentsView upstream endpoints
 # ---------------------------------------------------------------------------
-_PATENT_SEARCH_BASE = "https://api.patentsview.org/patents/query"
-_PATENT_FULLTEXT_BASE = "https://efts.uspto.gov/LATEST/search-index"
-_PEDS_BASE = "https://ped.uspto.gov/api"
-_TRADEMARK_SEARCH_BASE = "https://tsdrapi.uspto.gov/ts/cd"
+# PatentsView legacy api.patentsview.org endpoints were retired. The current
+# PatentSearch API is hosted on the Search Platform and uses X-Api-Key.
+_PATENT_SEARCH_BASE = os.getenv(
+    "PATENTSVIEW_BASE_URL",
+    "https://search.patentsview.org/api/v1/patent/",
+)
+
+# PEDS was retired. Patent application/file-wrapper data now lives in ODP.
+_ODP_APPLICATION_BASE = os.getenv(
+    "USPTO_ODP_APPLICATION_BASE_URL",
+    "https://api.uspto.gov/api/v1/patent/applications",
+)
+
+_TRADEMARK_BASE = os.getenv(
+    "USPTO_TSDR_BASE_URL",
+    "https://tsdrapi.uspto.gov/ts/cd",
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def _api_key() -> str:
-    key = os.getenv("USPTO_API_KEY", "")
+    key = os.getenv("USPTO_API_KEY", "").strip()
     if not key:
         raise RuntimeError(
             "USPTO_API_KEY is not set. Add it to the environment or Azure Key Vault secret 'kv-offset3/uspto-odp-api-key'."
         )
     return key
+
+
+def _patentsview_api_key() -> str:
+    key = os.getenv("PATENTSVIEW_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError(
+            "PATENTSVIEW_API_KEY is not set. Patent search will use the ODP "
+            "Patent File Wrapper fallback instead."
+        )
+    return key
+
+
+def _tsdr_api_key() -> str:
+    """Return a TSDR key, falling back to USPTO_API_KEY for compatibility.
+
+    TSDR is a separate USPTO API product. Deployments that have a dedicated
+    TSDR credential should set USPTO_TSDR_API_KEY. Existing installations can
+    still try their ODP key; an upstream 401 is normalized with an actionable
+    message instead of leaking the credential.
+    """
+    return os.getenv("USPTO_TSDR_API_KEY", "").strip() or _api_key()
 
 
 def _truthy_env(value: str | None) -> bool:
@@ -63,26 +98,124 @@ def _get_transport_security_settings() -> TransportSecuritySettings | None:
     )
 
 
-def _headers() -> dict[str, str]:
+def _patentsview_headers() -> dict[str, str]:
     return {
-        "X-Api-Key": _api_key(),
+        "X-Api-Key": _patentsview_api_key(),
         "Accept": "application/json",
-        "User-Agent": "OFFSET3-odp-mcp/1.0",
+        "User-Agent": "OFFSET3-odp-mcp/2.0",
     }
 
 
-async def _get(url: str, params: dict | None = None) -> dict[str, Any]:
+def _odp_headers() -> dict[str, str]:
+    return {
+        "X-API-KEY": _api_key(),
+        "Accept": "application/json",
+        "User-Agent": "OFFSET3-odp-mcp/2.0",
+    }
+
+
+def _tsdr_headers() -> dict[str, str]:
+    return {
+        "USPTO-API-KEY": _tsdr_api_key(),
+        "Accept": "application/json",
+        "User-Agent": "OFFSET3-odp-mcp/2.0",
+    }
+
+
+async def _get(
+    url: str,
+    params: dict | None = None,
+    *,
+    headers: dict[str, str] | None = None,
+) -> dict[str, Any]:
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(url, params=params, headers=_headers())
+        resp = await client.get(url, params=params, headers=headers or _odp_headers())
         resp.raise_for_status()
         return resp.json()
 
 
-async def _post(url: str, payload: dict) -> dict[str, Any]:
+async def _post(
+    url: str,
+    payload: dict,
+    *,
+    headers: dict[str, str] | None = None,
+) -> dict[str, Any]:
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(url, json=payload, headers=_headers())
+        resp = await client.post(url, json=payload, headers=headers or _odp_headers())
         resp.raise_for_status()
         return resp.json()
+
+
+def _upstream_error(exc: httpx.HTTPStatusError, *, service: str) -> dict[str, Any]:
+    status_code = exc.response.status_code
+    if service == "TSDR" and status_code == 401:
+        return {
+            "error": (
+                "TSDR rejected the configured credential. TSDR uses the "
+                "USPTO-API-KEY header and may require a separate TSDR API key. "
+                "Set USPTO_TSDR_API_KEY if your ODP key is not authorized for TSDR."
+            ),
+            "status_code": 401,
+            "service": service,
+        }
+    return {"error": str(exc), "status_code": status_code, "service": service}
+
+
+def _normalize_odp_application(record: dict[str, Any]) -> dict[str, Any]:
+    # ODP has returned both nested Patent File Wrapper records and flattened
+    # patentBag search records across revisions. Accept both shapes.
+    meta = record.get("applicationMetaData") or record
+    patent_number = meta.get("patentNumber")
+    return {
+        "patent_id": patent_number,
+        "patent_number": patent_number,
+        "patent_title": meta.get("inventionTitle"),
+        "patent_date": meta.get("grantDate"),
+        "application_number": (
+            meta.get("applicationNumberText")
+            or meta.get("applicationNumber")
+            or record.get("applicationNumberText")
+        ),
+        "application_status": (
+            meta.get("applicationStatusDescriptionText")
+            or meta.get("applicationStatusCode")
+        ),
+        "filing_date": meta.get("filingDate"),
+        "publication_number": meta.get("publicationNumber"),
+        "publication_date": meta.get("publicationDate"),
+    }
+
+
+async def _odp_patent_search_fallback(
+    query: str,
+    *,
+    page: int,
+    per_page: int,
+) -> dict[str, Any]:
+    params = {
+        "q": query,
+        "offset": (page - 1) * per_page,
+        "limit": per_page,
+    }
+    result = await _get(
+        f"{_ODP_APPLICATION_BASE}/search",
+        params=params,
+        headers=_odp_headers(),
+    )
+    applications = (
+        result.get("patentBag")
+        or result.get("patentFileWrapperDataBag")
+        or []
+    )
+    return {
+        "patents": [_normalize_odp_application(item) for item in applications],
+        "applications": applications,
+        "count": len(applications),
+        "total_patent_count": result.get("count"),
+        "page": page,
+        "per_page": per_page,
+        "source": "USPTO ODP Patent File Wrapper",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +328,8 @@ async def odp_capabilities() -> dict[str, Any]:
     return {
         "server": os.getenv("MCP_SERVER_NAME", "USPTO ODP"),
         "api_key_configured": bool(os.getenv("USPTO_API_KEY")),
+        "patentsview_api_key_configured": bool(os.getenv("PATENTSVIEW_API_KEY")),
+        "tsdr_api_key_configured": bool(os.getenv("USPTO_TSDR_API_KEY")),
         "tools": [
             "odp_patent_search",
             "odp_patent_get",
@@ -207,7 +342,16 @@ async def odp_capabilities() -> dict[str, Any]:
             "mcp_streamable_http_path": "/mcp",
             "mcp_sse_path": "/sse",
         },
-        "docs": "https://developer.uspto.gov/",
+        "docs": "https://data.uspto.gov/apis/getting-started",
+        "upstreams": {
+            "patents": _PATENT_SEARCH_BASE,
+            "applications": _ODP_APPLICATION_BASE,
+            "trademark_status": _TRADEMARK_BASE,
+        },
+        "limitations": {
+            "odp_patent_fulltext_search": "legacy EFTS public API retired; returns a stable unsupported response",
+            "odp_trademark_search": "TSDR has no documented free-text mark-search endpoint",
+        },
     }
 
 
@@ -237,20 +381,66 @@ async def odp_patent_search(
         Dict with patents list and total_patent_count.
     """
     if fields is None:
-        fields = ["patent_number", "patent_title", "patent_date", "patent_abstract", "inventors"]
+        fields = ["patent_id", "patent_title", "patent_date", "patent_abstract"]
+    else:
+        fields = ["patent_id" if field == "patent_number" else field for field in fields]
+
+    page = max(page, 1)
+    per_page = max(1, min(per_page, 100))
+
+    # Prefer PatentsView when its distinct credential is configured. Otherwise
+    # keep the connector useful with the ODP key by searching Patent File
+    # Wrapper application data.
+    if not os.getenv("PATENTSVIEW_API_KEY", "").strip():
+        try:
+            return await _odp_patent_search_fallback(
+                query,
+                page=page,
+                per_page=per_page,
+            )
+        except httpx.HTTPStatusError as exc:
+            return _upstream_error(exc, service="USPTO ODP Patent File Wrapper")
+        except Exception as exc:
+            return {"error": str(exc), "service": "USPTO ODP Patent File Wrapper"}
+
+    requested_size = page * per_page
+    if requested_size > 1000:
+        return {
+            "error": "PatentsView supports at most 1000 results per query; reduce page or per_page.",
+            "status_code": 400,
+            "service": "PatentsView",
+        }
 
     payload = {
-        "q": {"_text_any": {"patent_title": query, "patent_abstract": query}},
+        "q": {
+            "_or": [
+                {"_text_any": {"patent_title": query}},
+                {"_text_any": {"patent_abstract": query}},
+            ]
+        },
         "f": fields,
-        "o": {"page": page, "per_page": min(per_page, 100)},
+        "o": {"size": requested_size},
     }
 
     try:
-        return await _post(_PATENT_SEARCH_BASE, payload)
+        result = await _post(_PATENT_SEARCH_BASE, payload, headers=_patentsview_headers())
+        patents = result.get("patents", [])
+        start = (page - 1) * per_page
+        end = start + per_page
+        paged = patents[start:end]
+        for patent in paged:
+            if "patent_id" in patent and "patent_number" not in patent:
+                patent["patent_number"] = patent["patent_id"]
+        result["patents"] = paged
+        result["count"] = len(paged)
+        result["page"] = page
+        result["per_page"] = per_page
+        result["source"] = "PatentsView PatentSearch"
+        return result
     except httpx.HTTPStatusError as exc:
-        return {"error": str(exc), "status_code": exc.response.status_code}
+        return _upstream_error(exc, service="PatentsView")
     except Exception as exc:
-        return {"error": str(exc)}
+        return {"error": str(exc), "service": "PatentsView"}
 
 
 # ---------------------------------------------------------------------------
@@ -275,28 +465,57 @@ async def odp_patent_get(
         Patent record dict.
     """
     if fields is None:
-        fields = [
-            "patent_number", "patent_title", "patent_date", "patent_abstract",
-            "inventors", "assignees", "cpcs", "claims",
-        ]
+        fields = ["patent_id", "patent_title", "patent_date", "patent_abstract"]
+    else:
+        fields = ["patent_id" if field == "patent_number" else field for field in fields]
 
-    # Normalize: strip leading "US" and kind code if present
-    normalized = patent_number.strip().upper()
+    normalized = patent_number.strip().upper().replace(",", "").replace(" ", "")
     if normalized.startswith("US"):
         normalized = normalized[2:]
-    normalized = normalized.rstrip("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[:0])  # keep digits + kind
-    # PatentsView expects numeric or alphanumeric patent_number
+    # Strip common USPTO kind codes (A1, B1, B2, S1, etc.) while preserving
+    # design identifiers such as D345393.
+    normalized = re.sub(r"([A-Z]\d?)$", "", normalized)
+
+    if not os.getenv("PATENTSVIEW_API_KEY", "").strip():
+        try:
+            result = await _odp_patent_search_fallback(
+                normalized,
+                page=1,
+                per_page=10,
+            )
+            exact = [
+                patent
+                for patent in result.get("patents", [])
+                if str(patent.get("patent_number") or "").upper() == normalized
+            ]
+            result["patents"] = exact
+            result["count"] = len(exact)
+            result["requested_patent_number"] = normalized
+            if not exact:
+                result["not_found"] = True
+            return result
+        except httpx.HTTPStatusError as exc:
+            return _upstream_error(exc, service="USPTO ODP Patent File Wrapper")
+        except Exception as exc:
+            return {"error": str(exc), "service": "USPTO ODP Patent File Wrapper"}
+
     payload = {
-        "q": {"patent_number": patent_number.strip()},
+        "q": {"patent_id": normalized},
         "f": fields,
+        "o": {"size": 1},
     }
 
     try:
-        return await _post(_PATENT_SEARCH_BASE, payload)
+        result = await _post(_PATENT_SEARCH_BASE, payload, headers=_patentsview_headers())
+        for patent in result.get("patents", []):
+            if "patent_id" in patent and "patent_number" not in patent:
+                patent["patent_number"] = patent["patent_id"]
+        result["source"] = "PatentsView PatentSearch"
+        return result
     except httpx.HTTPStatusError as exc:
-        return {"error": str(exc), "status_code": exc.response.status_code}
+        return _upstream_error(exc, service="PatentsView")
     except Exception as exc:
-        return {"error": str(exc)}
+        return {"error": str(exc), "service": "PatentsView"}
 
 
 # ---------------------------------------------------------------------------
@@ -326,26 +545,29 @@ async def odp_patent_fulltext_search(
     Returns:
         Dict with hits list (patent_id, title, patent_number, date, snippet).
     """
-    params: dict[str, Any] = {
-        "q": query,
-        "rows": min(rows, 500),
+    # The public EFTS host used by this connector is no longer a supported
+    # USPTO API surface. Do not disguise DNS/transport failures as search
+    # results. Keep the tool contract stable and return an actionable result.
+    return {
+        "error": (
+            "USPTO EFTS full-text API is no longer available at the legacy "
+            "public endpoint used by this connector. Use odp_patent_search "
+            "for grant title/abstract search and odp_application_status for "
+            "ODP Patent File Wrapper application data."
+        ),
+        "status_code": 410,
+        "service": "USPTO EFTS",
+        "supported": False,
+        "query": query,
+        "date_range_start": date_range_start,
+        "date_range_end": date_range_end,
+        "rows": rows,
         "start": start,
-        "fl": "patent_title,patent_number,patent_date,patent_abstract",
     }
-    if date_range_start and date_range_end:
-        params["dateRangeData"] = f"[{date_range_start} TO {date_range_end}]"
-
-    try:
-        result = await _get(_PATENT_FULLTEXT_BASE, params=params)
-        return result
-    except httpx.HTTPStatusError as exc:
-        return {"error": str(exc), "status_code": exc.response.status_code}
-    except Exception as exc:
-        return {"error": str(exc)}
 
 
 # ---------------------------------------------------------------------------
-# Tool: Patent application status (PEDS)
+# Tool: Patent application status (ODP Patent File Wrapper)
 # ---------------------------------------------------------------------------
 
 @mcp.tool(
@@ -355,36 +577,23 @@ async def odp_patent_fulltext_search(
 async def odp_application_status(
     application_number: str,
 ) -> dict[str, Any]:
-    """Retrieve patent application status from USPTO PEDS (Patent Examination Data System).
+    """Retrieve patent application data/status from USPTO ODP Patent File Wrapper.
 
     Args:
         application_number: USPTO application number (e.g. "16123456" or "16/123,456").
 
     Returns:
-        Application status, filing date, examiner, and prosecution history summary.
+        Patent File Wrapper application metadata, status, parties, and event data.
     """
-    # Normalize: strip slashes and commas
     normalized = application_number.strip().replace("/", "").replace(",", "").replace(" ", "")
-
-    url = f"{_PEDS_BASE}/queries"
-    payload = {
-        "searchText": f"applId:{normalized}",
-        "fq": [],
-        "fl": "*",
-        "facet": False,
-        "sort": "applId asc",
-        "start": 0,
-        "rows": 1,
-        "highlighting": True,
-        "mm": "100%",
-    }
+    url = f"{_ODP_APPLICATION_BASE}/{normalized}"
 
     try:
-        return await _post(url, payload)
+        return await _get(url, headers=_odp_headers())
     except httpx.HTTPStatusError as exc:
-        return {"error": str(exc), "status_code": exc.response.status_code}
+        return _upstream_error(exc, service="USPTO ODP Patent File Wrapper")
     except Exception as exc:
-        return {"error": str(exc)}
+        return {"error": str(exc), "service": "USPTO ODP Patent File Wrapper"}
 
 
 # ---------------------------------------------------------------------------
@@ -406,19 +615,19 @@ async def odp_trademark_status(
     Returns:
         Trademark status, owner, goods/services, and prosecution history.
     """
-    normalized = serial_number.strip().replace("-", "")
-    url = f"{_TRADEMARK_SEARCH_BASE}/casestatus/{normalized}/info"
+    normalized = serial_number.strip().replace("-", "").replace(" ", "")
+    url = f"{_TRADEMARK_BASE}/casestatus/sn{normalized}/info.json"
 
     try:
-        return await _get(url)
+        return await _get(url, headers=_tsdr_headers())
     except httpx.HTTPStatusError as exc:
-        return {"error": str(exc), "status_code": exc.response.status_code}
+        return _upstream_error(exc, service="TSDR")
     except Exception as exc:
-        return {"error": str(exc)}
+        return {"error": str(exc), "service": "TSDR"}
 
 
 # ---------------------------------------------------------------------------
-# Tool: Trademark search (TESS via ODP)
+# Tool: Trademark search
 # ---------------------------------------------------------------------------
 
 @mcp.tool(
@@ -431,33 +640,26 @@ async def odp_trademark_search(
     page: int = 1,
     rows: int = 25,
 ) -> dict[str, Any]:
-    """Search USPTO trademarks by mark name via the TSDR ODP API.
+    """Report the current support status for trademark free-text search.
 
-    Args:
-        mark_name: Trademark text to search (e.g. "AresNet").
-        status: Filter by status: "live", "dead", or "all".
-        page: Page number (1-indexed).
-        rows: Results per page (max 100).
-
-    Returns:
-        List of matching trademarks with serial numbers, owner, status, and IC classes.
+    TSDR is an identifier-based status/document API; it does not provide the
+    free-text mark-search endpoint previously assumed by this connector.
     """
-    params: dict[str, Any] = {
-        "searchText": mark_name,
-        "rows": min(rows, 100),
-        "start": (page - 1) * rows,
+    return {
+        "error": (
+            "USPTO TSDR does not provide a documented free-text trademark "
+            "search endpoint. The previous /trademark/search route was invalid. "
+            "Use odp_trademark_status when you have a serial number, or use the "
+            "USPTO Trademark Search web service for mark-name discovery."
+        ),
+        "status_code": 501,
+        "service": "USPTO Trademark Search",
+        "supported": False,
+        "mark_name": mark_name,
+        "status": status,
+        "page": page,
+        "rows": rows,
     }
-    if status.lower() in ("live", "dead"):
-        params["status"] = status.lower()
-
-    url = f"{_TRADEMARK_SEARCH_BASE}/trademark/search"
-
-    try:
-        return await _get(url, params=params)
-    except httpx.HTTPStatusError as exc:
-        return {"error": str(exc), "status_code": exc.response.status_code}
-    except Exception as exc:
-        return {"error": str(exc)}
 
 
 # ---------------------------------------------------------------------------
